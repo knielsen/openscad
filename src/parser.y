@@ -71,6 +71,7 @@ void lexer_set_parser_sourcefile(const fs::path& path);
 int lexerlex_destroy(void);
 int lexerlex(void);
 static void handle_assignment(const std::string token, Expression *expr, const Location loc);
+static void handle_user_func_arg_list(AssignmentList *orig_args);
 
 std::stack<LocalScope *> scope_stack;
 FileModule *rootmodule;
@@ -158,7 +159,7 @@ bool fileEnded=false;
 
 %type <arg> argument_call
 %type <arg> argument_decl
-%type <text> module_id
+%type <text> module_or_function_id
 
 %debug
 %locations
@@ -197,12 +198,26 @@ statement
             {
                 scope_stack.pop();
             }
-        | TOK_FUNCTION TOK_ID '(' arguments_decl optional_commas ')' '=' expr ';'
+        | TOK_FUNCTION TOK_ID '(' arguments_decl ')' '=' expr ';'
             {
-              UserFunction *func = new UserFunction($2, *$4, shared_ptr<Expression>($8), LOCD("function", @$));
+              UserFunction *func = new UserFunction($2, *$4, shared_ptr<Expression>($7), LOCD("function", @$));
               scope_stack.top()->addFunction(func);
               free($2);
               delete $4;
+            }
+        /* We use "arguments_call" here to avoid a reduce/reduce conflict with
+           module instantiation. The arguments will be checked for validity in
+           handle_user_func_arg_list().
+           ToDo: Something to check module_or_function_id for invalid names. */
+        | module_or_function_id '(' arguments_call ')' '=' expr ';'
+            {
+              handle_user_func_arg_list($3);
+              UserFunction *func = new UserFunction($1, *$3,
+                                                    shared_ptr<Expression>($6),
+                                                    LOCD("function", @$));
+              scope_stack.top()->addFunction(func);
+              free($1);
+              delete $3;
             }
         | TOK_EOT
             {
@@ -305,7 +320,7 @@ child_statement
         ;
 
 // "for", "let" and "each" are valid module identifiers
-module_id
+module_or_function_id
         : TOK_ID  { $$ = $1; }
         | TOK_FOR { $$ = strdup("for"); }
         | TOK_LET { $$ = strdup("let"); }
@@ -315,7 +330,7 @@ module_id
         ;
 
 single_module_instantiation
-        : module_id '(' arguments_call ')'
+        : module_or_function_id '(' arguments_call ')'
             {
                 $$ = new ModuleInstantiation($1, *$3, main_file_folder, LOCD("modulecall", @$));
                 free($1);
@@ -732,6 +747,33 @@ void handle_assignment(const std::string token, Expression *expr, const Location
 	if (!found) {
 		scope_stack.top()->addAssignment(Assignment(token, shared_ptr<Expression>(expr), loc));
 	}
+}
+
+// Due to LALR(1) parser limits (reduce/reduce conflict...), user function
+// definitions "f(x)=x*x;" need to share parsing of argument list with module
+// instantiation "cube([10,10,10]);". This function checks that the function
+// declaration argument list is valid, and converts it into the expected
+// format.
+void handle_user_func_arg_list(AssignmentList *orig_args)
+{
+  for (auto&& a : *orig_args) {
+    if (a.expr && a.name.compare("") == 0) {
+      // This is the case "f(x) = 2*x;". This was parsed into an Assignment
+      // object with empty variable name and and expression containing just
+      // the identifier "x".
+      // Check that the expression is a simple identifier, and rewrite the
+      // assignment with the identifier name and an empty expression.
+      if (typeid(*a.expr) == typeid(Lookup)) {
+        Lookup *lookup = static_cast<Lookup *>(&*a.expr);
+        // ToDo: lifetime, memory leak, etc. etc.
+        a.name = lookup->get_name();
+      } else {
+        PRINTB("ERROR: Invalid function declaration argument ToDo ToDo ios<<expr file/lineno %s\n", "ToDoToDo");
+        a.name = std::string("<unknown>");
+      }
+      a.expr = NULL;
+    }
+  }
 }
 
 bool parse(FileModule *&module, const std::string& text, const std::string &filename, const std::string &mainFile, int debug)
